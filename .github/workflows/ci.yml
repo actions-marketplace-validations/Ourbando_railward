@@ -22,6 +22,8 @@ jobs:
         run: |
           python -m railward.cli lint --policy examples/safe.yaml
           python -m railward.cli lint --policy examples/strict.yaml
+      - name: taxonomy coverage doc matches the live gate (exits 2 on drift)
+        run: python -m railward.cli coverage --policy examples/strict.yaml
       - name: proof is green
         run: |
           python -m railward.cli attack --key /tmp/ci.pem --out /tmp/proof.json

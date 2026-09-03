@@ -5,6 +5,7 @@ The default is fail-closed. A policy may only set ``default: deny`` or ``default
 """
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,59 @@ from pathlib import Path
 import yaml
 
 EFFECTS = ("allow", "deny", "ask")
+
+# A single rule may not expand past this many concrete patterns. Brace alternation multiplies, so
+# a policy typo like ten nested ten-way groups is 10^10 patterns and a hang, which is a fail-open.
+# Rejected at LOAD, the same treatment the catastrophic-regex check gets in policy.py.
+MAX_BRACE_EXPANSIONS = 512
+
+
+@functools.lru_cache(maxsize=2048)
+def expand_braces(pattern: str) -> tuple[str, ...]:
+    """Expand ``{a,b}`` alternation into brace-free patterns, outermost group first, nesting-aware.
+
+    fnmatch has no brace syntax, so without this a policy needs one rule per filename and the
+    dangerous-path rules become dozens of near-duplicates nobody reads. Pure and total: an
+    unbalanced brace is treated as a literal rather than raising, because a policy that fails to
+    load is a gate that is not running.
+    """
+    start = pattern.find("{")
+    if start == -1:
+        return (pattern,)
+
+    depth, end = 0, -1
+    for i in range(start, len(pattern)):
+        if pattern[i] == "{":
+            depth += 1
+        elif pattern[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        return (pattern,)  # unbalanced: literal
+
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in pattern[start + 1:end]:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+
+    prefix, suffix = pattern[:start], pattern[end + 1:]
+    out: list[str] = []
+    for part in parts:
+        out.extend(expand_braces(prefix + part + suffix))
+    return tuple(out)
+
 
 # A group that contains an unbounded quantifier and is itself quantified, e.g. ``(a+)+`` or
 # ``(.*)*``. This is the classic catastrophic-backtracking (ReDoS) shape: matching a crafted input
@@ -53,6 +107,16 @@ class Rule:
                     f"the gate cannot be hung by a crafted command"
                 )
             object.__setattr__(self, "command_re", compiled)
+        if self.path is not None:
+            # Brace alternation multiplies, so a nested typo can expand to millions of patterns and
+            # hang the matcher. A hang is a fail-open, so the bound is checked at LOAD, the same
+            # treatment the catastrophic-regex shape gets above.
+            expansions = len(expand_braces(self.path))
+            if expansions > MAX_BRACE_EXPANSIONS:
+                raise ValueError(
+                    f"rule {self.id!r}: path glob {self.path!r} expands to {expansions} patterns "
+                    f"(limit {MAX_BRACE_EXPANSIONS}); split it into separate rules so matching "
+                    f"stays bounded")
 
 
 @dataclass(frozen=True)

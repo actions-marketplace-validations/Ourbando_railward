@@ -47,20 +47,72 @@ def sign_head(chain: list[dict], private_key: Ed25519PrivateKey) -> str:
     return private_key.sign(head_hash(chain).encode()).hex()
 
 
-def verify_chain(
-    chain: list[dict], signature_hex: str, public_key: Ed25519PublicKey
-) -> tuple[bool, str]:
+def _chain_intact(chain: list[dict]) -> tuple[bool, str, str]:
     prev = ""
     for i, record in enumerate(chain):
         if record.get("seq") != i:
-            return False, f"chain order broken at index {i}"
+            return False, f"chain order broken at index {i}", ""
         if record.get("prev") != prev:
-            return False, f"chain link broken at seq {i}"
+            return False, f"chain link broken at seq {i}", ""
         if record.get("hash") != _record_hash(record, prev):
-            return False, f"hash mismatch at seq {i} (record was altered)"
+            return False, f"hash mismatch at seq {i} (record was altered)", ""
         prev = record["hash"]
+    return True, "ok", prev
+
+
+def verify_chain(
+    chain: list[dict], signature_hex: str, public_key: Ed25519PublicKey
+) -> tuple[bool, str]:
+    ok, message, head = _chain_intact(chain)
+    if not ok:
+        return False, message
     try:
-        public_key.verify(bytes.fromhex(signature_hex), prev.encode())
+        public_key.verify(bytes.fromhex(signature_hex), head.encode())
+    except Exception:
+        return False, "signature does not verify against the pinned key"
+    return True, "ok"
+
+
+# The top-level claims a reader might quote without recomputing the chain. From proof
+# version 3 these are what the signature covers (the head pins every record, so the chain
+# is still covered through it).
+SUMMARY_KEYS = ("version", "kind", "total", "leaked", "robustness_total",
+                "robustness_failed_open", "head")
+
+
+def proof_summary(proof: dict) -> dict:
+    return {k: proof[k] for k in SUMMARY_KEYS if k in proof}
+
+
+def sign_proof(proof: dict, private_key: Ed25519PrivateKey) -> str:
+    return private_key.sign(canonical(proof_summary(proof))).hex()
+
+
+def verify_proof(proof: dict, public_key: Ed25519PublicKey) -> tuple[bool, str]:
+    """Verify a whole proof document: chain integrity, summary honesty, signature.
+
+    The summary cross-check runs on every version. A version 2 proof signs only the head,
+    so its top-level counters sit outside the signature; a counter that disagrees with the
+    signed records is a forgery either way, and fails here instead of reading as green.
+    """
+    chain = proof.get("chain") or []
+    ok, message, head = _chain_intact(chain)
+    if not ok:
+        return False, message
+    recomputed = {
+        "total": sum(1 for r in chain if "attack" in r),
+        "leaked": sum(1 for r in chain if r.get("leaked")),
+        "robustness_total": sum(1 for r in chain if "probe" in r),
+        "robustness_failed_open": sum(1 for r in chain if r.get("failed_open")),
+        "head": head,
+    }
+    for key, value in recomputed.items():
+        if key in proof and proof[key] != value:
+            return False, (f"summary claims {key} = {proof[key]!r} but the signed records "
+                           f"say {value!r} (summary was edited)")
+    signed = canonical(proof_summary(proof)) if proof.get("version", 0) >= 3 else head.encode()
+    try:
+        public_key.verify(bytes.fromhex(proof["sig"]), signed)
     except Exception:
         return False, "signature does not verify against the pinned key"
     return True, "ok"

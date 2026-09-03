@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.resources
 import json
 import os
 import sys
@@ -24,6 +25,16 @@ rules:
 """
 
 _MARK = {"allow": "+", "ask": "?", "deny": "x"}
+
+
+def _load_policy_arg(policy_arg: str | None):
+    """No --policy means the strict policy shipped inside the package, so the command works
+    from any directory, installed or checked out."""
+    if policy_arg is None:
+        text = importlib.resources.files("railward").joinpath(
+            "policies/strict.yaml").read_text(encoding="utf-8")
+        return load_policy(text, text=True)
+    return load_policy(policy_arg)
 
 
 def _request_from_args(args: argparse.Namespace) -> dict:
@@ -76,7 +87,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_attack(args: argparse.Namespace) -> int:
-    policy = load_policy(args.policy)
+    policy = _load_policy_arg(args.policy)
     if args.key and os.path.exists(args.key):
         key = plog.load_private(args.key)
     else:
@@ -101,7 +112,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     with open(args.proof, encoding="utf-8") as fh:
         proof = json.load(fh)
     public_key = plog.load_public(args.pubkey)
-    ok, message = plog.verify_chain(proof["chain"], proof["sig"], public_key)
+    ok, message = plog.verify_proof(proof, public_key)
     if not ok:
         print(f"FAIL: {message}")
         return 2
@@ -134,6 +145,57 @@ def cmd_lint(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Measure the policy against the threat taxonomy, per category.
+
+    The headline number is not "how much did it block" (a default-deny gate blocks nearly
+    everything) but how much it blocks BY NAME, which is what survives an operator widening the
+    allow-list.
+    """
+    from . import taxonomy as tax
+
+    try:
+        policy = _load_policy_arg(args.policy)
+    except Exception as exc:  # noqa: BLE001 - any load failure is an invalid policy
+        print(f"INVALID: {exc}", file=sys.stderr)
+        return 2
+
+    if args.update:
+        changed = tax.rewrite_cov_column(policy)
+        print(f"taxonomy Cov column regenerated: {changed} row(s) changed")
+        return 0
+
+    measured = tax.measure(policy)
+    if args.leaks:
+        for threat, verdict in measured:
+            if verdict == tax.LEAK:
+                print(f"{tax.MARK[verdict]}  {threat.category} / {threat.name}: {threat.example}")
+
+    by_category: dict[str, dict[str, int]] = {}
+    for threat, verdict in measured:
+        row = by_category.setdefault(threat.category, {tax.DENY_RULE: 0, tax.DEFAULT_ONLY: 0, tax.LEAK: 0})
+        row[verdict] += 1
+    width = max(len(c) for c in by_category)
+    for category, row in by_category.items():
+        print(f"  {category.ljust(width)}  D={row[tax.DENY_RULE]:<4} "
+              f"~={row[tax.DEFAULT_ONLY]:<4} X={row[tax.LEAK]}")
+
+    counts = tax.summarize(measured)
+    print(f"\n{counts['total']} classes: {counts[tax.DENY_RULE]} deny-rule, "
+          f"{counts[tax.DEFAULT_ONLY]} default-only, {counts[tax.LEAK]} leak")
+    problems = tax.drift(measured)
+    if problems:
+        # A doc that disagrees with the gate is an error in every context, so it always exits
+        # nonzero. A leak is a finding, not an error: the taxonomy names two classes a
+        # path-and-token gate cannot decide, so `--fail-on-leak` is opt-in for CI that wants zero.
+        print(f"DOC DRIFT: {len(problems)} row(s) disagree with live measurement "
+              f"(regenerate with --update)", file=sys.stderr)
+        for p in problems[:10]:
+            print(f"  - {p}", file=sys.stderr)
+        return 2
+    return 1 if (args.fail_on_leak and counts[tax.LEAK]) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="railward",
@@ -151,7 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     lint.set_defaults(fn=cmd_lint)
 
     attack = sub.add_parser("attack", help="run the adversary and write a signed proof")
-    attack.add_argument("--policy", default="examples/safe.yaml")
+    attack.add_argument("--policy", default=None,
+                        help="policy YAML (default: the strict policy shipped in the package)")
     attack.add_argument("--key", default="keys/demo.pem", help="signing key (generated if missing)")
     attack.add_argument("--out", default="proof.json")
     attack.set_defaults(fn=cmd_attack)
@@ -167,6 +230,17 @@ def main(argv: list[str] | None = None) -> int:
     explain.add_argument("--action", help='or a full request JSON, e.g. \'{"action":"read","path":"x"}\'')
     explain.set_defaults(fn=cmd_explain)
 
+    coverage = sub.add_parser(
+        "coverage", help="measure a policy against the threat taxonomy (deny-rule / default-only / leak)")
+    coverage.add_argument("--policy", default=None,
+                          help="policy YAML (default: the strict policy shipped in the package)")
+    coverage.add_argument("--leaks", action="store_true", help="list every leaking class")
+    coverage.add_argument("--update", action="store_true",
+                          help="regenerate the taxonomy doc's Cov column from live measurement")
+    coverage.add_argument("--fail-on-leak", action="store_true",
+                          help="exit 1 if any class leaks (doc drift always exits 2)")
+    coverage.set_defaults(fn=cmd_coverage)
+
     ctf = sub.add_parser("ctf", help="a game: find an attack that slips through a holed policy")
     ctf.add_argument("--list", action="store_true", help="list the attack names")
     ctf.add_argument("--guess", help="name the attack you think leaks")
@@ -176,7 +250,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd is None:  # bare `railward`: show usage
         parser.print_help()
         return 0
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except FileNotFoundError as exc:
+        # A missing input is an operator mistake, not a crash: name it and fail closed.
+        print(f"error: no such file: {exc.filename or exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

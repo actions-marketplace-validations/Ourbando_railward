@@ -1,5 +1,5 @@
 .PHONY: test attack verify lint demo demo-gif gate clean
-POLICY ?= examples/safe.yaml
+POLICY ?= examples/strict.yaml
 
 test:
 	python -m pytest -q

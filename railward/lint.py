@@ -20,6 +20,13 @@ def lint_policy(policy: Policy) -> list[str]:
     """Return a list of problem strings; empty means the policy is clean."""
     problems: list[str] = []
     rules = policy.rules
+    for rule in rules:
+        # The ``**/`` prefix broadens a pattern (see decide._glob). Broadening a deny is the point;
+        # broadening an allow silently permits more than it reads, so it is reported.
+        if rule.effect == "allow" and (rule.path or "").startswith("**/"):
+            problems.append(
+                f"allow rule {rule.id!r} uses the widening '**/' path prefix: it would permit the "
+                f"pattern at every depth, which is broader than it reads; write the exact path")
     for j, deny in enumerate(rules):
         if deny.effect != "deny":
             continue

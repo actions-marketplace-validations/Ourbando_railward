@@ -1,6 +1,6 @@
 {
   "name": "railward",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fail-closed, veto-only decision gate at the agent tool-call choke point, with a re-runnable signed proof of every gated decision.",
   "author": {
     "name": "Armando Shkambi"

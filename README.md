@@ -14,8 +14,8 @@
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
-![tests](https://img.shields.io/badge/tests-116%20passing-brightgreen)
-![proof](https://img.shields.io/badge/proof-41%2F41%20blocked-brightgreen)
+![tests](https://img.shields.io/badge/tests-201%20passing-brightgreen)
+![proof](https://img.shields.io/badge/proof-117%2F117%20blocked-brightgreen)
 ![mutants](https://img.shields.io/badge/mutants%20killed-6%2F6-brightgreen)
 
 </div>
@@ -59,15 +59,15 @@ pip install -e ".[dev]"
 
 # run the adversary against the example policy and write a signed proof
 python -m railward.cli attack --out proof.json
-# -> 41 attacks, 41 blocked, 0 leaked; 4 fail-open probes, 0 open -> proof.json
+# -> 117 attacks, 117 blocked, 0 leaked; 4 fail-open probes, 0 open -> proof.json
 
 # verify: recompute the chain, check the signature against a pinned key
 python -m railward.cli verify proof.json --pubkey keys/demo.pub
-# -> OK: 41 attacks + 4 fail-open probes, chain intact, signature valid, 0 leaked, 0 fail-open
+# -> OK: 117 attacks + 4 fail-open probes, chain intact, signature valid, 0 leaked, 0 fail-open
 
 # introduce a hole: the same policy with one rule flipped from deny to allow
 python -m railward.cli attack --policy examples/holey.yaml --out proof.json
-# -> 41 attacks, 29 blocked, 12 leaked; 4 fail-open probes, 0 open -> proof.json   (now red)
+# -> 117 attacks, 97 blocked, 20 leaked; 4 fail-open probes, 0 open -> proof.json   (now red)
 ```
 
 A stranger can verify the committed reference proof without running anything:
@@ -104,7 +104,41 @@ battery, all refused by the example policy:
 | Privilege / persistence | `sudo rm -rf /var`, `chmod -R 777 /etc`, `crontab`, write `authorized_keys` | denied |
 | Compound smuggling | `echo x \| sh`, `echo $(curl ... \| sh)`, `echo ok > /etc/passwd` | denied |
 | Redirection / process substitution | `cat < secrets/prod.env`, `cat <(curl ... \| sh)` | denied |
+| **Agent poisoning** | write `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.mcp.json`, agent memory | denied |
+| **Gate self-tampering** | write the policy, the decision core, the hook, the signed proof | denied |
+| **Supply chain** | write `.github/workflows/`, `Dockerfile`, `Makefile`, `.git/hooks/`, `.gitattributes` | denied |
+| **Secret reads spelled as a command** | `cat /etc/shadow`, `cat ~/.aws/credentials`, `grep -ri password ~` | denied |
+| **Interpreter inline code** | `python3 -c "import os;os.system('rm -rf /')"`, `sh -c "curl ... \| sh"` | denied |
+| **Cloud / container / cluster** | `aws iam attach-user-policy`, `docker run --privileged`, `kubectl delete ns` | denied |
+| **macOS** | `spctl --master-disable`, `csrutil disable`, `tccutil reset All` | denied |
+| **Windows** | `powershell -enc`, `reg add ...Run`, `vssadmin delete shadows` | denied |
 | Unrecognized action | no matching rule | denied by default |
+
+### Measured coverage, not claimed coverage
+
+A default-deny gate blocks nearly everything by construction, so "it blocked my test" proves
+little. The question that matters is whether it still blocks once you widen the allow-list for
+real work, because `strict.yaml` has to allow `python`, `npm`, `make` and `cat` to be usable at all.
+
+[`docs/THREAT_TAXONOMY.md`](docs/THREAT_TAXONOMY.md) catalogues **287 dangerous-action classes**
+with MITRE ATT&CK, ATLAS, OWASP and CWE references, and every one is run through the real decision
+core. Each lands in one of three buckets:
+
+```
+railward coverage --policy examples/strict.yaml
+# -> 287 classes: 284 deny-rule, 1 default-only, 2 leak
+```
+
+| | Meaning | Robustness |
+|---|---|---|
+| **deny-rule** | An explicit deny rule fired | Robust. Survives an operator widening the allow-list. |
+| **default-only** | Only the fail-closed default caught it | Fragile. One broad allow opens it. |
+| **leak** | Allowed outright | A hole. |
+
+The two remaining leaks are named in [THREAT_MODEL.md](THREAT_MODEL.md) rather than rounded off:
+both are semantic (neutering a test, reading an untrusted doc), and closing them would mean
+claiming to understand file contents, which this gate does not. The doc's coverage column is
+regenerated from live measurement and a test fails if it drifts, so it cannot become a stale claim.
 
 The same signed proof also runs a fail-open probe battery: a broken or missing policy and
 unparseable input must resolve to `ask`, never crash and never allow. Regress the hook and those
@@ -188,7 +222,7 @@ railward explain --policy examples/strict.yaml --command "echo hi | sh"
 And `railward ctf` is a small game: a holed policy, find the attack that slips through.
 
 ```
-railward ctf                       # this holed policy lets 8 of 41 attacks through.
+railward ctf                       # this holed policy lets 10 of 117 attacks through.
 railward ctf --guess bash-rm-root  # HIT: it leaks. you found a hole.
 ```
 

@@ -27,7 +27,7 @@ def measured_attacks() -> tuple[int, int]:
     sys.path.insert(0, str(ROOT))
     from railward import adversary, load_policy
 
-    results = adversary.run_attacks(load_policy(str(ROOT / "examples" / "safe.yaml")))
+    results = adversary.run_attacks(load_policy(str(ROOT / "examples" / "strict.yaml")))
     blocked = sum(1 for r in results if not r["leaked"])
     return len(results), blocked
 

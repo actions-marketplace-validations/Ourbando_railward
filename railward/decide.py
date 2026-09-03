@@ -28,12 +28,12 @@ import fnmatch
 import posixpath
 import shlex
 from dataclasses import dataclass
+from types import MappingProxyType
 
-from .policy import Policy
+from .policy import MAX_BRACE_EXPANSIONS, Policy, expand_braces  # noqa: F401
 
 _MAX_COMMAND = 100_000  # bound the matching input
 _SEVERITY = ("allow", "ask", "deny")  # index is severity; most restrictive (highest) wins
-
 
 @dataclass(frozen=True)
 class Decision:
@@ -60,7 +60,25 @@ def _canonical_path(path: str) -> str:
 
 
 def _glob(pattern: str, value: str) -> bool:
-    return fnmatch.fnmatchcase(value, pattern)
+    """fnmatch, plus one documented extension: a ``**/`` prefix means "at any depth, including none".
+
+    Plain fnmatch has no notion of a path separator, so ``*`` already crosses ``/`` and ``*/X``
+    matches ``a/X`` and ``/repo/X`` but NOT a bare ``X``. That gap matters: the dangerous file is
+    usually named relative to the repo root (``CLAUDE.md``, ``.mcp.json``), and a rule written to
+    catch it nested would sail straight past the top-level form. ``**/CLAUDE.md`` catches both.
+
+    The extension only ever makes a pattern match MORE. On a deny rule that is strictly stronger.
+    On an allow rule it would be strictly weaker, so ``railward lint`` reports an allow rule that
+    uses it rather than leaving the widening silent.
+    """
+    for alt in expand_braces(pattern):
+        if alt.startswith("**/"):
+            tail = alt[3:]
+            if fnmatch.fnmatchcase(value, tail) or fnmatch.fnmatchcase(value, "*/" + tail):
+                return True
+        elif fnmatch.fnmatchcase(value, alt):
+            return True
+    return False
 
 
 def _segments(command: str) -> list[str]:
@@ -242,15 +260,130 @@ def _read_targets(command: str) -> list[str]:
     return targets
 
 
-def _fragments(command: str) -> list[str]:
-    """Every independently-executable command string inside ``command``: top-level segments plus
-    the bodies of every command substitution, recursively."""
+# Commands whose job is to read a file and put its contents somewhere the agent can see them.
+# Secret rules are path-based, but ``cat /etc/shadow`` carries no ``path`` field: it is a bash
+# command whose ARGUMENT is the path, so without this extraction every path rule is bypassed by
+# spelling the read as a shell command.
+_READ_COMMANDS = frozenset({
+    "cat", "head", "tail", "tac", "nl", "less", "more", "strings", "xxd", "od", "hexdump",
+    "base64", "base32", "uuencode", "grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk",
+    "cut", "column", "sort", "uniq", "wc", "file", "jq", "yq", "md5sum", "sha1sum", "sha256sum",
+    "shasum", "openssl", "cp", "mv", "scp", "rsync", "tar", "zip", "gzip", "install",
+    "sqlite3", "sqlite",
+})
+
+# Commands whose FIRST positional argument is a pattern or script, not a file. Treating it as a
+# path would deny an innocent ``grep secret-handling-notes README`` on the search term alone, so
+# the first positional is skipped for these.
+_PATTERN_FIRST = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk"})
+
+
+def _command_read_targets(fragment: str) -> list[str]:
+    """File arguments of a known read-command, to be checked as reads.
+
+    Deliberately over-inclusive on arguments and under-inclusive on commands. Every target here is
+    an ADDITIONAL sub-decision and the final verdict is the most restrictive one, so a wrong guess
+    can only add a deny that a path rule already justified, never remove one. A missed command is
+    a missed protection, never a hole.
+    """
+    try:
+        argv = shlex.split(fragment)
+    except ValueError:
+        return []
+    if not argv:
+        return []
+    head = (posixpath.basename(argv[0]) or argv[0]).lower()
+    if head not in _READ_COMMANDS:
+        return []
+    targets: list[str] = []
+    skip_pattern = head in _PATTERN_FIRST
+    for arg in argv[1:]:
+        if arg.startswith("-"):
+            continue
+        if skip_pattern:            # the search pattern or script, not a file
+            skip_pattern = False
+            continue
+        targets.append(arg)
+    return targets
+
+
+# Interpreters that take a program as a command-line STRING. The string is code, so it is pushed
+# back through the gate: `python -c "import os;os.system('rm -rf /')"` must not be safe merely
+# because the dangerous token sits inside a quoted argument.
+_INLINE_CODE_FLAGS = MappingProxyType({
+    "python": ("-c",), "python2": ("-c",), "python3": ("-c",), "perl": ("-e", "-E"),
+    "ruby": ("-e",), "node": ("-e", "--eval", "-p"), "deno": ("eval",), "bun": ("-e",),
+    "php": ("-r",), "sh": ("-c",), "bash": ("-c",), "zsh": ("-c",), "dash": ("-c",),
+    "ksh": ("-c",), "Rscript": ("-e",),
+})
+
+# Recursion bound. Inline code can nest (`sh -c "python -c '...'"`), and a crafted payload could
+# nest arbitrarily; an unbounded walk is a hang, and a hang is a fail-open.
+_MAX_FRAGMENT_DEPTH = 8
+
+
+def _inline_code(fragment: str) -> list[str]:
+    """Program strings passed to an interpreter via ``-c`` / ``-e`` / ``-r``."""
+    try:
+        argv = shlex.split(fragment)
+    except ValueError:
+        return []
+    if not argv:
+        return []
+    head = posixpath.basename(argv[0]) or argv[0]
+    flags = _INLINE_CODE_FLAGS.get(head) or _INLINE_CODE_FLAGS.get(head.lower())
+    if not flags:
+        return []
     out: list[str] = []
-    stack = [command]
+    for i, arg in enumerate(argv[1:], start=1):
+        if arg in flags and i + 1 < len(argv):
+            out.append(argv[i + 1])
+    return out
+
+
+def _fragments(command: str) -> list[str]:
+    """Every independently-executable SHELL command string inside ``command``: top-level segments
+    plus the bodies of every command substitution, recursively."""
+    out: list[str] = []
+    stack = [(command, 0)]
+    seen: set[str] = set()
     while stack:
-        cur = stack.pop()
+        cur, depth = stack.pop()
+        if cur in seen or depth > _MAX_FRAGMENT_DEPTH:
+            continue
+        seen.add(cur)
         out.extend(_segments(cur))
-        stack.extend(_substitutions(cur))
+        for nested in _substitutions(cur):
+            stack.append((nested, depth + 1))
+    return out
+
+
+def _inline_fragments(command: str) -> list[str]:
+    """Every interpreter inline-code string reachable from ``command``, recursively.
+
+    Kept separate from ``_fragments`` because these are held to a DIFFERENT rule (see
+    ``_evaluate``): an inline program is code, not a shell command, so the fail-closed default must
+    not be applied to it. If it were, every ``python -c`` would deny on the default, since a Python
+    expression matches no shell rule, and the gate would be unusable for ordinary work.
+    """
+    out: list[str] = []
+    stack = [(command, 0)]
+    seen: set[str] = set()
+    while stack:
+        cur, depth = stack.pop()
+        if cur in seen or depth > _MAX_FRAGMENT_DEPTH:
+            continue
+        seen.add(cur)
+        for code in _inline_code(cur):
+            out.append(code)
+            # Inline code can itself contain shell: `sh -c "curl x | sh"`. Walk into its segments,
+            # substitutions and any further inline code so a nested payload is still reached.
+            for nested in [code, *_segments(code), *_substitutions(code)]:
+                stack.append((nested, depth + 1))
+            out.extend(_segments(code))
+        for nested in _segments(cur) + _substitutions(cur):
+            if nested != cur:
+                stack.append((nested, depth + 1))
     return out
 
 
@@ -308,6 +441,7 @@ def _evaluate(action: str, command: str | None, canonical: str | None,
 
     out: list[tuple[str, Decision]] = []
     seen: set[str] = set()
+    read_args: list[str] = []
     for idx, frag in enumerate([command, *_fragments(command)]):
         if frag in seen:
             continue
@@ -318,11 +452,29 @@ def _evaluate(action: str, command: str | None, canonical: str | None,
         label = "command" if idx == 0 else "sub-command"
         frag_path = canonical if idx == 0 else None
         out.append((f"{label}: {frag}", _match(action, normalized, frag, frag_path, policy)))
+        # Per fragment, so `pwd; cat /etc/shadow` is caught in the segment that reads.
+        read_args.extend(_command_read_targets(frag))
 
     for tgt in _redirect_targets(command):
         out.append((f"writes: {tgt}", _match("write", None, None, _canonical_path(tgt), policy)))
     for tgt in _read_targets(command):
         out.append((f"reads: {tgt}", _match("read", None, None, _canonical_path(tgt), policy)))
+    for tgt in dict.fromkeys(read_args):  # de-duplicated, order preserved for a stable trace
+        out.append((f"reads: {tgt}", _match("read", None, None, _canonical_path(tgt), policy)))
+
+    # Interpreter inline code, deny-only. A NAMED rule matching the program string counts, so
+    # `python -c "import os;os.system('rm -rf /')"` is denied by the same rule that names `rm`.
+    # No match contributes nothing, so an ordinary one-liner falls through to whatever the policy
+    # says about running an interpreter at all (in strict.yaml: ask). This preserves the invariant
+    # that decomposition can only ADD a deny, never open a hole, and it is why the semantic
+    # ceiling is honest: `python -c "shutil.rmtree('/')"` names nothing, so it asks, not denies.
+    for code in dict.fromkeys(_inline_fragments(command)):
+        normalized = _normalized_command(code)
+        if normalized is None:
+            continue
+        decision = _match(action, normalized, code, None, policy)
+        if decision.rule_id and decision.verdict != "allow":
+            out.append((f"inline code: {code}", decision))
     return out
 
 

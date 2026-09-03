@@ -72,12 +72,20 @@ control layer, not a sandbox. It does not, and cannot by construction, stop the 
   than an accident, but it cannot make it *impossible*.
 - **Symlink games under an innocent name.** Path scoping resolves `..` but does not chase a symlink
   whose name looks in-scope.
-- **Reads through a permitted command.** If a policy allows a file-reading command (`cat`, `head`,
-  `less`) without constraint, that command can read any file the account can read, whether the path
-  is an argument (`cat secrets`) or arrives through a substitution (`diff <(cat secrets)`). Input
-  *redirection* (`< secrets`) is now caught as a read, but the gate does not model the file
-  semantics of every binary's arguments. Scope allowed commands accordingly, or gate the read at
-  the `read` action instead of the `bash` action.
+- **Reads through a permitted command.** File arguments of a known read-command (`cat`, `head`,
+  `grep`, and the rest of the list in `decide.py`) are now extracted and checked as reads, so
+  `cat /etc/shadow` is refused by the same path rules that refuse `read /etc/shadow`. The list is
+  finite. A reader not on it, or a binary whose argument semantics the gate does not model, still
+  reads whatever the account can read. Scope allowed commands accordingly.
+- **The semantics of interpreter inline code.** This is the sharpest limit and it is worth stating
+  precisely. `python -c` and `node -e` take a program as a string. railward pushes that string back
+  through the gate, so anything it *names* is caught: `python3 -c "import os;os.system('rm -rf /')"`
+  is DENIED by the same rule that names `rm`, and `sh -c "curl x | sh"` by the rule that names
+  `curl`. But token matching cannot read intent. `python -c "shutil.rmtree('/')"` contains no token
+  any rule names, and no amount of regex will fix that, because deciding what arbitrary code does
+  is undecidable in general. So the honest answer is a verdict, not a claim: interpreter inline code
+  that names nothing dangerous resolves to **`ask`**, not `allow` and not `deny`. It reaches a human
+  rather than running silently, and railward does not pretend to have read it.
 
 True impossibility for those requires a layer this project does not pretend to be: the agent's
 runtime as a **separate, sandboxed OS user** that does not own the sensitive files, and secrets on
@@ -85,6 +93,29 @@ a **hardware token or off-host** so no on-box read can retrieve the private mate
 `railward` with those and the guarantees compose; deploy it alone and you have
 **default-denied and tamper-evident**, which is a real and useful property, but is not the same
 word as "impossible". We will not sell you the stronger word.
+
+## Measured coverage, including what is not covered
+
+Coverage is measured, not asserted. [docs/THREAT_TAXONOMY.md](docs/THREAT_TAXONOMY.md) catalogues
+287 dangerous-action classes with their MITRE ATT&CK, ATLAS, OWASP and CWE references, and every
+one is run through the real decision core against `examples/strict.yaml`. Reproduce it with
+`railward coverage`; a test fails if the document and the gate disagree.
+
+Against `examples/strict.yaml`: **284 blocked by a named deny rule, 1 default-only, 2 leak.**
+
+The distinction matters more than the total. A default-deny gate blocks nearly everything by
+construction, but a class caught *only* by the default is one broad `allow python` away from being
+open. A named deny survives that edit.
+
+Two classes are known **not** covered, and are named here rather than rounded off:
+
+- **Neutering a test so it always passes.** Writing tests is core developer work, so the path is
+  legitimate and the harm is in the content. A path-and-token gate cannot decide it.
+- **Reading an untrusted document that then steers later tool calls.** The read is not the harm;
+  the harm is the next action, which the gate does see and judge on its own merits.
+
+Both are semantic. Closing them would mean claiming to understand content, which is the same
+overclaim the interpreter ceiling above refuses to make.
 
 ## Residual risk and how to lower it
 
