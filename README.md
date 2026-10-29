@@ -14,7 +14,7 @@
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
-![tests](https://img.shields.io/badge/tests-201%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-208%20passing-brightgreen)
 ![proof](https://img.shields.io/badge/proof-117%2F117%20blocked-brightgreen)
 ![mutants](https://img.shields.io/badge/mutants%20killed-6%2F6-brightgreen)
 
@@ -54,6 +54,8 @@ lands on a signed, hash-chained log.
 
 ## Prove it in a minute
 
+Needs Python 3.10 or newer. Check with `python3 --version` (the macOS system Python is 3.9).
+
 ```
 pip install -e ".[dev]"
 
@@ -76,7 +78,7 @@ A stranger can verify the committed reference proof without running anything:
 python -m railward.cli verify examples/reference_proof.json --pubkey examples/pubkey.pem
 ```
 
-Or verify with no install at all: open [`docs/verify.html`](docs/verify.html) in a browser, paste a
+Or verify with no install at all: open [the browser verifier](https://ourbando.github.io/railward/verify.html) in a browser, paste a
 `proof.json`, and it recomputes the hash chain and checks the Ed25519 signature client-side. Nothing
 is uploaded.
 
